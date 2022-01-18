@@ -68,7 +68,6 @@ struct BrokerSubscriptionOptions {
 struct Config {
     broker_url: String,
     prefetch_count: u16,
-    // topics: HashSet<String>,
     topics: HashMap<String, BrokerSubscriptionOptions>,
     broker_config: BrokerOptions,
     heartbeat: Option<u16>,
@@ -78,24 +77,28 @@ pub struct GCPPubSubBrokerBuilder {
     config: Config,
 }
 
+impl GCPPubSubBrokerBuilder {
+    fn get_broker_options() -> Result<BrokerOptions, BrokerError> {
+        if let Ok(config_file_path) = std::env::var("GCPPUBSUB_CONFIG") {
+            let config_file = File::open(config_file_path).map_err(BrokerError::IoError)?;
+            let reader = BufReader::new(config_file);
+            serde_json::from_reader(reader).map_err(BrokerError::DeserializeError)
+        } else {
+            warn!(
+                "No suscription configuration file defined in env var \"GCPPUBSUB_CONFIG\". \
+            The broker will only be able to send messages."
+            );
+            Ok(HashMap::new())
+        }
+    }
+}
+
 #[async_trait]
 impl BrokerBuilder for GCPPubSubBrokerBuilder {
     type Broker = GCPPubSubBroker;
 
     fn new(broker_url: &str) -> Self {
-        // Broker configuration
-        let configuration_file = File::open(
-            "/home/nico/proyectos/celery/rusty-celery-original/examples/gcp_config.json",
-        )
-        .unwrap();
-
-        let reader = BufReader::new(configuration_file);
-
-        // let config = serde_json::from_reader::<BufReader<File>, BrokerOptions>(reader).unwrap();
-        let broker_config: BrokerOptions = serde_json::from_reader(reader).unwrap();
-
-        println!("Config: {:#?}", broker_config);
-
+        let broker_config = Self::get_broker_options().unwrap();
         Self {
             config: Config {
                 broker_url: broker_url.into(),
@@ -112,14 +115,16 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         self
     }
 
-    fn declare_queue(mut self, name: &str) -> Self {
-        println!("Declare queue: {}", name);
-        if let Some(suscription) = self.config.broker_config.get(name) {
+    fn declare_queue(mut self, topic_name: &str) -> Self {
+        if let Some(suscription) = self.config.broker_config.get(topic_name) {
             self.config
                 .topics
-                .insert(name.to_string(), suscription.clone());
+                .insert(topic_name.to_owned(), suscription.clone());
         } else {
-            warn!("There is no configured subscription for topic \"{}\"", name)
+            warn!(
+                "There is no configured subscription for topic \"{}\"",
+                topic_name
+            )
         }
 
         self
