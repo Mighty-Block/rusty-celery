@@ -1,0 +1,6 @@
+{
+  "celery": {
+    "name": "test_suscription",
+    "ack_deadline_seconds": 25
+  }
+}

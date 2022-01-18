@@ -1,0 +1,497 @@
+//! Defines mock broker that can be used to test other components that rely on a broker.
+//! Primero crear un topic en el emu
+//! curl -X PUT http://127.0.0.1:8538/v1/projects/emulator/topics/celery
+//! Producir un mensaje
+//! cargo run --example celery_app_gcp produce add
+//! Consumir
+//! cargo run --example celery_app_gcp consume
+use super::{Broker, BrokerBuilder};
+use crate::error::{BrokerError, ProtocolError};
+use crate::protocol::{self, Message, TryDeserializeMessage};
+use async_trait::async_trait;
+use base64;
+use chrono::{DateTime, Utc};
+use futures::{
+    task::{Context, Poll},
+    Stream,
+};
+use log::{debug, warn};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::future::Future;
+use std::io::BufReader;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
+use std::task::Waker;
+use uuid::Uuid;
+
+// Internal pubsub message
+#[derive(Serialize, Deserialize, Debug)]
+struct PubsubMessage {
+    data: String,
+
+    #[serde(rename(deserialize = "messageId"))]
+    message_id: String,
+
+    #[serde(rename(deserialize = "publishTime"))]
+    publish_time: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ReceivedMessage {
+    #[serde(rename(deserialize = "ackId"))]
+    ack_id: String,
+
+    #[serde(rename(deserialize = "deliveryAttempt"))]
+    delivery_attempt: Option<u32>,
+
+    message: PubsubMessage,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PubsubPullResponse {
+    #[serde(rename(deserialize = "receivedMessages"))]
+    received_messages: Vec<ReceivedMessage>,
+}
+
+// Broker configurations
+type BrokerOptions = HashMap<String, BrokerSubscriptionOptions>;
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct BrokerSubscriptionOptions {
+    name: String,
+    ack_deadline_seconds: Option<u16>,
+}
+
+struct Config {
+    broker_url: String,
+    prefetch_count: u16,
+    // topics: HashSet<String>,
+    topics: HashMap<String, BrokerSubscriptionOptions>,
+    broker_config: BrokerOptions,
+    heartbeat: Option<u16>,
+}
+
+pub struct GCPPubSubBrokerBuilder {
+    config: Config,
+}
+
+#[async_trait]
+impl BrokerBuilder for GCPPubSubBrokerBuilder {
+    type Broker = GCPPubSubBroker;
+
+    fn new(broker_url: &str) -> Self {
+        // Broker configuration
+        let configuration_file = File::open(
+            "/home/nico/proyectos/celery/rusty-celery-original/examples/gcp_config.json",
+        )
+        .unwrap();
+
+        let reader = BufReader::new(configuration_file);
+
+        // let config = serde_json::from_reader::<BufReader<File>, BrokerOptions>(reader).unwrap();
+        let broker_config: BrokerOptions = serde_json::from_reader(reader).unwrap();
+
+        println!("Config: {:#?}", broker_config);
+
+        Self {
+            config: Config {
+                broker_url: broker_url.into(),
+                broker_config,
+                prefetch_count: 10,
+                topics: HashMap::new(),
+                heartbeat: Some(60),
+            },
+        }
+    }
+
+    fn prefetch_count(mut self, prefetch_count: u16) -> Self {
+        self.config.prefetch_count = prefetch_count;
+        self
+    }
+
+    fn declare_queue(mut self, name: &str) -> Self {
+        println!("Declare queue: {}", name);
+        if let Some(suscription) = self.config.broker_config.get(name) {
+            self.config
+                .topics
+                .insert(name.to_string(), suscription.clone());
+        } else {
+            warn!("There is no configured subscription for topic \"{}\"", name)
+        }
+
+        self
+    }
+
+    fn heartbeat(mut self, heartbeat: Option<u16>) -> Self {
+        self.config.heartbeat = heartbeat;
+        self
+    }
+
+    async fn build(&self, _connection_timeout: u32) -> Result<Self::Broker, BrokerError> {
+        // Base Url
+        let base_url = format!("{}/v1/projects/emulator", &self.config.broker_url);
+
+        Ok(GCPPubSubBroker {
+            base_url,
+            topics: self.config.topics.clone(),
+            prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
+            pending_tasks: Arc::new(AtomicU16::new(0)),
+        })
+    }
+}
+
+pub struct GCPPubSubBroker {
+    base_url: String,
+
+    topics: HashMap<String, BrokerSubscriptionOptions>,
+
+    prefetch_count: Arc<AtomicU16>,
+
+    pending_tasks: Arc<AtomicU16>,
+}
+
+#[async_trait]
+impl Broker for GCPPubSubBroker {
+    type Builder = GCPPubSubBrokerBuilder;
+    type Delivery = (GCPChannel, GCPDelivery);
+    type DeliveryError = BrokerError;
+    type DeliveryStream = GCPConsumer;
+
+    fn safe_url(&self) -> String {
+        self.base_url.clone()
+    }
+
+    async fn consume<E: Fn(BrokerError) + Send + Sync + 'static>(
+        &self,
+        topic: &str,
+        error_handler: Box<E>,
+    ) -> Result<(String, Self::DeliveryStream), BrokerError> {
+        println!("Consume: {}", topic);
+        // Suscribe to topics
+        let suscription_options = self.topics.get(topic);
+
+        if let Some(subscription) = suscription_options {
+            // Create unique consumer tag.
+            let mut buffer = Uuid::encode_buffer();
+            let uuid = Uuid::new_v4().to_hyphenated().encode_lower(&mut buffer);
+            let consumer_tag = uuid.to_owned();
+
+            // Create the channel
+            let gcp_channel = GCPChannel::new(
+                self.base_url.clone(),
+                topic.to_string(),
+                subscription.clone(),
+            );
+
+            // Suscribe to the topic with the given subscription
+            gcp_channel.subscribe_to_topic().await?;
+
+            let consumer = GCPConsumer {
+                pending_tasks: self.pending_tasks.clone(),
+                prefetch_count: self.prefetch_count.clone(),
+                polled_pop: None,
+                channel: gcp_channel,
+                error_handler,
+            };
+
+            Ok((consumer_tag, consumer))
+        } else {
+            Err(BrokerError::UnknownQueue(format!(
+                "There is no subscription configuration for topic \"{}\"",
+                topic
+            )))
+        }
+    }
+
+    async fn cancel(&self, _consumer_tag: &str) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    async fn ack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        let (channel, delivered_message) = delivery;
+
+        channel
+            .acknowledge(delivered_message.acknowledge_id.clone())
+            .await
+    }
+
+    async fn nack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        let (channel, delivered_message) = delivery;
+
+        // Send nack to pubsub
+        channel
+            .modify_ack_deadline(delivered_message.acknowledge_id.clone(), 0)
+            .await
+    }
+
+    #[allow(unused)]
+    async fn retry(
+        &self,
+        delivery: &Self::Delivery,
+        eta: Option<DateTime<Utc>>,
+    ) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    async fn send(&self, message: &Message, topic: &str) -> Result<(), BrokerError> {
+        // We use the default subscription because we do not need a subscription to send a message
+        // to a topic.
+        let channel = GCPChannel::new(
+            self.base_url.clone(),
+            topic.to_string(),
+            BrokerSubscriptionOptions::default(),
+        );
+
+        channel.send_message(message).await
+    }
+
+    async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
+        self.prefetch_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn decrease_prefetch_count(&self) -> Result<(), BrokerError> {
+        self.prefetch_count.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), BrokerError> {
+        // There is no socket so we don't close the connection
+        Ok(())
+    }
+
+    async fn reconnect(&self, _connection_timeout: u32) -> Result<(), BrokerError> {
+        // There is no active connection so we don't reconnect
+        Ok(())
+    }
+
+    async fn on_message_processed(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        // If the task finished, means we can decrement the pending_task
+        self.pending_tasks.fetch_sub(1, Ordering::SeqCst);
+
+        // If the pending tasks are less than the prefecth, we wake up the stream to continue
+        // processing messages
+        if self.pending_tasks.load(Ordering::SeqCst) < self.prefetch_count.load(Ordering::SeqCst) {
+            if let Some(waker) = &delivery.1.waker {
+                waker.wake_by_ref();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GCPChannel {
+    connection: reqwest::Client,
+    base_url: String,
+    topic: String,
+    subscription: BrokerSubscriptionOptions,
+}
+
+impl GCPChannel {
+    fn new(base_url: String, topic: String, subscription: BrokerSubscriptionOptions) -> Self {
+        GCPChannel {
+            connection: reqwest::Client::new(),
+            base_url,
+            topic,
+            subscription,
+        }
+    }
+
+    async fn pull_message(self) -> GCPConsumerOutput {
+        println!("Pulling messages...");
+        let response = self
+            .connection
+            .post(format!(
+                "{}/subscriptions/{}:pull",
+                &self.base_url, &self.subscription.name
+            ))
+            .body(r#"{ "maxMessages": 1 }"#)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| BrokerError::NotConnected)?;
+
+        let response_body = response
+            .text()
+            .await
+            .map_err(|e| BrokerError::NotConnected)?;
+
+        println!("Pulled message: {}", &response_body);
+
+        let deserealized_msg = serde_json::from_str::<PubsubPullResponse>(&response_body)
+            .map_err(BrokerError::DeserializeError)?;
+
+        let received_message = &deserealized_msg.received_messages[0];
+
+        let data = base64::decode(&received_message.message.data)
+            .map_err(|e| BrokerError::NotConnected)?;
+
+        println!(
+            "ID {:?}",
+            &deserealized_msg.received_messages[0].message.message_id
+        );
+
+        let mut delivery: protocol::Delivery =
+            serde_json::from_slice(&data).map_err(BrokerError::DeserializeError)?;
+
+        delivery.headers.retries = received_message.delivery_attempt;
+
+        Ok(GCPDelivery {
+            acknowledge_id: received_message.ack_id.clone(),
+            suscription: self.subscription.name,
+            waker: None,
+            delivery,
+        })
+    }
+
+    async fn send_message(&self, message: &Message) -> Result<(), BrokerError> {
+        let message_payload = base64::encode(message.json_serialized()?);
+        let formatted_message = json!({ "messages": [{ "data": message_payload }] }).to_string();
+
+        self.connection
+            .post(format!("{}/topics/{}:publish", &self.base_url, &self.topic))
+            .body((formatted_message.into_bytes()).to_vec())
+            .send()
+            .await
+            .map_err(|_e| BrokerError::NotConnected)?;
+
+        Ok(())
+    }
+
+    async fn acknowledge(&self, acknowledge_id: String) -> Result<(), BrokerError> {
+        self.connection
+            .post(format!(
+                "{}/subscriptions/{}:acknowledge",
+                &self.base_url, &self.subscription.name
+            ))
+            .body(format!(r#"{{ "ackIds": [ "{}" ] }}"#, acknowledge_id))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| BrokerError::NotConnected)?;
+
+        Ok(())
+    }
+
+    async fn modify_ack_deadline(
+        &self,
+        acknowledge_id: String,
+        ack_deadline_seconds: u16,
+    ) -> Result<(), BrokerError> {
+        self.connection
+            .post(format!(
+                "{}/subscriptions/{}:modifyAckDeadline",
+                &self.base_url, &self.subscription.name
+            ))
+            .body(format!(
+                r#"{{ "ackIds": [ "{}" ], "ackDeadlineSeconds": {} }}"#,
+                acknowledge_id, ack_deadline_seconds
+            ))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| BrokerError::NotConnected)?;
+
+        Ok(())
+    }
+
+    async fn subscribe_to_topic(&self) -> Result<(), BrokerError> {
+        self.connection
+            .put(format!(
+                "{}/subscriptions/{}",
+                &self.base_url, &self.subscription.name
+            ))
+            .body(format!(
+                r#"{{ "topic": "projects/emulator/topics/{}" }}"#,
+                &self.topic
+            ))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .ok();
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GCPDelivery {
+    acknowledge_id: String,
+    suscription: String,
+    waker: Option<Waker>,
+    delivery: protocol::Delivery,
+}
+
+impl TryDeserializeMessage for (GCPChannel, GCPDelivery) {
+    fn try_deserialize_message(&self) -> Result<Message, ProtocolError> {
+        self.1.delivery.try_deserialize_message()
+    }
+}
+
+type GCPConsumerOutput = Result<GCPDelivery, BrokerError>;
+type GCPConsumerOutputFuture = Box<dyn Future<Output = Result<GCPDelivery, BrokerError>>>;
+
+pub struct GCPConsumer {
+    pending_tasks: Arc<AtomicU16>,
+    prefetch_count: Arc<AtomicU16>,
+    channel: GCPChannel,
+    polled_pop: Option<std::pin::Pin<GCPConsumerOutputFuture>>,
+    error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
+}
+
+impl Stream for GCPConsumer {
+    type Item = Result<(GCPChannel, GCPDelivery), BrokerError>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        // If we have more pending tasks than the prefetch count, we leave them pending until we
+        // can process them...
+        if self.pending_tasks.load(Ordering::SeqCst) >= self.prefetch_count.load(Ordering::SeqCst)
+            && self.prefetch_count.load(Ordering::SeqCst) > 0
+        {
+            // If acks_late is true, this Pending is waken up by the ack function when a pending
+            // task is terminated!
+            return Poll::Pending;
+        }
+
+        // If the polled_pop is None, means we have to pull a message from the queue, otherwise we
+        // have a Future that can be Resolved or Pending
+        let mut polled_message = if self.polled_pop.is_none() {
+            Box::pin(self.channel.clone().pull_message())
+        } else {
+            // It is safe to unwrap here since we have the is_none in the if branch
+            self.polled_pop.take().unwrap()
+        };
+
+        // To execute the pull_message function, since it is an async Task we have to Poll it.
+        //
+        // If it is Ready:
+        //  - If the task succeed, we add one to the pending_task and return the trask
+        //  - Otherwise we handle the error, notify the executor the Stream is ready to run again,
+        //    and return the Pending state
+        //
+        // If it is NOT Ready: Put the Future inside the Option again and return the Pending state
+        if let Poll::Ready(item) = Future::poll(polled_message.as_mut(), cx) {
+            match item {
+                Ok(mut item) => {
+                    self.pending_tasks.fetch_add(1, Ordering::SeqCst);
+                    item.waker = Some(cx.waker().clone());
+                    Poll::Ready(Some(Ok((self.channel.clone(), item))))
+                }
+                Err(err) => {
+                    (self.error_handler)(err);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        } else {
+            self.polled_pop = Some(polled_message);
+            // The poll function will tell us when to wake up
+            Poll::Pending
+        }
+    }
+}
