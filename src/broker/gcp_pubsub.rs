@@ -15,13 +15,13 @@ use futures::{
     task::{Context, Poll},
     Stream,
 };
-use log::{debug, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::future::Future;
-use std::io::BufReader;
+use std::io::{BufReader, ErrorKind};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
@@ -53,7 +53,7 @@ struct ReceivedMessage {
 #[derive(Serialize, Deserialize, Debug)]
 struct PubsubPullResponse {
     #[serde(rename(deserialize = "receivedMessages"))]
-    received_messages: Vec<ReceivedMessage>,
+    received_messages: Option<Vec<ReceivedMessage>>,
 }
 
 // Broker configurations
@@ -308,38 +308,36 @@ impl GCPChannel {
     }
 
     async fn pull_message(self) -> GCPConsumerOutput {
-        println!("Pulling messages...");
-        let response = self
-            .connection
-            .post(format!(
-                "{}/subscriptions/{}:pull",
-                &self.base_url, &self.subscription.name
-            ))
-            .body(r#"{ "maxMessages": 1 }"#)
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .map_err(|e| BrokerError::NotConnected)?;
+        // We have this loop in case the long polling request returns nothing. We just pull again
+        let deserealized_msg = loop {
+            println!("Pulling messages...");
+            let response = self
+                .connection
+                .post(format!(
+                    "{}/subscriptions/{}:pull",
+                    &self.base_url, &self.subscription.name
+                ))
+                .body(r#"{ "maxMessages": 1 }"#)
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+                .map_err(BrokerError::GCPPubsubError)?;
 
-        let response_body = response
-            .text()
-            .await
-            .map_err(|e| BrokerError::NotConnected)?;
+            let response_body = response.text().await.map_err(BrokerError::GCPPubsubError)?;
 
-        println!("Pulled message: {}", &response_body);
+            let deserialized = serde_json::from_str::<PubsubPullResponse>(&response_body)
+                .map_err(BrokerError::DeserializeError)?;
 
-        let deserealized_msg = serde_json::from_str::<PubsubPullResponse>(&response_body)
-            .map_err(BrokerError::DeserializeError)?;
+            if let Some(messages) = deserialized.received_messages {
+                break messages;
+            }
+        };
 
-        let received_message = &deserealized_msg.received_messages[0];
+        let received_message = &deserealized_msg[0];
 
-        let data = base64::decode(&received_message.message.data)
-            .map_err(|e| BrokerError::NotConnected)?;
-
-        println!(
-            "ID {:?}",
-            &deserealized_msg.received_messages[0].message.message_id
-        );
+        let data = base64::decode(&received_message.message.data).map_err(|e| {
+            BrokerError::IoError(std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
+        })?;
 
         let mut delivery: protocol::Delivery =
             serde_json::from_slice(&data).map_err(BrokerError::DeserializeError)?;
@@ -363,7 +361,7 @@ impl GCPChannel {
             .body((formatted_message.into_bytes()).to_vec())
             .send()
             .await
-            .map_err(|_e| BrokerError::NotConnected)?;
+            .map_err(BrokerError::GCPPubsubError)?;
 
         Ok(())
     }
@@ -378,7 +376,7 @@ impl GCPChannel {
             .header("Content-Type", "application/json")
             .send()
             .await
-            .map_err(|e| BrokerError::NotConnected)?;
+            .map_err(BrokerError::GCPPubsubError)?;
 
         Ok(())
     }
@@ -400,7 +398,7 @@ impl GCPChannel {
             .header("Content-Type", "application/json")
             .send()
             .await
-            .map_err(|e| BrokerError::NotConnected)?;
+            .map_err(BrokerError::GCPPubsubError)?;
 
         Ok(())
     }

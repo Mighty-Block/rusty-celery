@@ -163,6 +163,10 @@ pub enum BrokerError {
     /// Any other Redis error that could happen.
     #[error("Redis error \"{0}\"")]
     RedisError(#[from] redis::RedisError),
+
+    /// Any other GCP Pubsub error that could happen.
+    #[error("GCP Pubsub error \"{0}\"")]
+    GCPPubsubError(#[from] reqwest::Error),
 }
 
 impl BrokerError {
