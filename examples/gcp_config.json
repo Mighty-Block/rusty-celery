@@ -2,5 +2,8 @@
   "celery": {
     "name": "test_suscription",
     "ack_deadline_seconds": 25
+  },
+  "buggy-queue": {
+    "name": "buggy_queue_subscription"
   }
 }

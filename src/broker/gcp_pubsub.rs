@@ -70,7 +70,6 @@ struct Config {
     prefetch_count: u16,
     topics: HashMap<String, BrokerSubscriptionOptions>,
     broker_config: BrokerOptions,
-    heartbeat: Option<u16>,
 }
 
 pub struct GCPPubSubBrokerBuilder {
@@ -86,7 +85,7 @@ impl GCPPubSubBrokerBuilder {
         } else {
             warn!(
                 "No suscription configuration file defined in env var \"GCPPUBSUB_CONFIG\". \
-            The broker will only be able to send messages."
+                The broker will only be able to send messages."
             );
             Ok(HashMap::new())
         }
@@ -105,7 +104,6 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
                 broker_config,
                 prefetch_count: 10,
                 topics: HashMap::new(),
-                heartbeat: Some(60),
             },
         }
     }
@@ -130,8 +128,7 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         self
     }
 
-    fn heartbeat(mut self, heartbeat: Option<u16>) -> Self {
-        self.config.heartbeat = heartbeat;
+    fn heartbeat(self, _heartbeat: Option<u16>) -> Self {
         self
     }
 
@@ -191,7 +188,7 @@ impl Broker for GCPPubSubBroker {
                 subscription.clone(),
             );
 
-            // Suscribe to the topic with the given subscription
+            // Susbcribe to the topic with the given subscription
             gcp_channel.subscribe_to_topic().await?;
 
             let consumer = GCPConsumer {
@@ -232,13 +229,21 @@ impl Broker for GCPPubSubBroker {
             .await
     }
 
-    #[allow(unused)]
     async fn retry(
         &self,
         delivery: &Self::Delivery,
-        eta: Option<DateTime<Utc>>,
+        _eta: Option<DateTime<Utc>>,
     ) -> Result<(), BrokerError> {
-        Ok(())
+        let (channel, _) = delivery;
+        let mut message = delivery.try_deserialize_message()?;
+
+        message.headers.retries = if let Some(retry_number) = message.headers.retries {
+            Some(retry_number + 1)
+        } else {
+            Some(1)
+        };
+
+        channel.send_message(&message).await
     }
 
     async fn send(&self, message: &Message, topic: &str) -> Result<(), BrokerError> {
@@ -339,10 +344,8 @@ impl GCPChannel {
             BrokerError::IoError(std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
         })?;
 
-        let mut delivery: protocol::Delivery =
+        let delivery: protocol::Delivery =
             serde_json::from_slice(&data).map_err(BrokerError::DeserializeError)?;
-
-        delivery.headers.retries = received_message.delivery_attempt;
 
         Ok(GCPDelivery {
             acknowledge_id: received_message.ack_id.clone(),
