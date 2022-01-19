@@ -56,8 +56,10 @@ struct PubsubPullResponse {
     received_messages: Option<Vec<ReceivedMessage>>,
 }
 
-// Broker configurations
-type BrokerOptions = HashMap<String, BrokerSubscriptionOptions>;
+// Subscription configuration for topics.
+// The key is the topic name.
+// The values is the suscription options for that topic.
+type BrokerTopicOptions = HashMap<String, BrokerSubscriptionOptions>;
 
 #[derive(Deserialize, Debug, Clone, Default)]
 struct BrokerSubscriptionOptions {
@@ -68,8 +70,6 @@ struct BrokerSubscriptionOptions {
 struct Config {
     broker_url: String,
     prefetch_count: u16,
-    topics: HashMap<String, BrokerSubscriptionOptions>,
-    broker_config: BrokerOptions,
 }
 
 pub struct GCPPubSubBrokerBuilder {
@@ -77,14 +77,14 @@ pub struct GCPPubSubBrokerBuilder {
 }
 
 impl GCPPubSubBrokerBuilder {
-    fn get_broker_options() -> Result<BrokerOptions, BrokerError> {
+    fn get_topic_subscription_options() -> Result<BrokerTopicOptions, BrokerError> {
         if let Ok(config_file_path) = std::env::var("GCPPUBSUB_CONFIG") {
             let config_file = File::open(config_file_path).map_err(BrokerError::IoError)?;
             let reader = BufReader::new(config_file);
             serde_json::from_reader(reader).map_err(BrokerError::DeserializeError)
         } else {
             warn!(
-                "No suscription configuration file defined in env var \"GCPPUBSUB_CONFIG\". \
+                "No suscription configuration file defined in environment variable \"GCPPUBSUB_CONFIG\". \
                 The broker will only be able to send messages."
             );
             Ok(HashMap::new())
@@ -97,13 +97,10 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
     type Broker = GCPPubSubBroker;
 
     fn new(broker_url: &str) -> Self {
-        let broker_config = Self::get_broker_options().unwrap();
         Self {
             config: Config {
                 broker_url: broker_url.into(),
-                broker_config,
                 prefetch_count: 10,
-                topics: HashMap::new(),
             },
         }
     }
@@ -113,18 +110,7 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         self
     }
 
-    fn declare_queue(mut self, topic_name: &str) -> Self {
-        if let Some(suscription) = self.config.broker_config.get(topic_name) {
-            self.config
-                .topics
-                .insert(topic_name.to_owned(), suscription.clone());
-        } else {
-            warn!(
-                "There is no configured subscription for topic \"{}\"",
-                topic_name
-            )
-        }
-
+    fn declare_queue(self, _queue: &str) -> Self {
         self
     }
 
@@ -136,9 +122,11 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         // Base Url
         let base_url = format!("{}/v1/projects/emulator", &self.config.broker_url);
 
+        let topics_subscriptions = Self::get_topic_subscription_options()?;
+
         Ok(GCPPubSubBroker {
             base_url,
-            topics: self.config.topics.clone(),
+            topics_subscriptions,
             prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
             pending_tasks: Arc::new(AtomicU16::new(0)),
         })
@@ -148,7 +136,8 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
 pub struct GCPPubSubBroker {
     base_url: String,
 
-    topics: HashMap<String, BrokerSubscriptionOptions>,
+    // Topics used as consumers through subscriptions
+    topics_subscriptions: BrokerTopicOptions,
 
     prefetch_count: Arc<AtomicU16>,
 
@@ -171,9 +160,8 @@ impl Broker for GCPPubSubBroker {
         topic: &str,
         error_handler: Box<E>,
     ) -> Result<(String, Self::DeliveryStream), BrokerError> {
-        println!("Consume: {}", topic);
         // Suscribe to topics
-        let suscription_options = self.topics.get(topic);
+        let suscription_options = self.topics_subscriptions.get(topic);
 
         if let Some(subscription) = suscription_options {
             // Create unique consumer tag.
@@ -237,10 +225,9 @@ impl Broker for GCPPubSubBroker {
         let (channel, _) = delivery;
         let mut message = delivery.try_deserialize_message()?;
 
-        message.headers.retries = if let Some(retry_number) = message.headers.retries {
-            Some(retry_number + 1)
-        } else {
-            Some(1)
+        message.headers.retries = match message.headers.retries {
+            Some(retry_number) => Some(retry_number + 1),
+            None => Some(1),
         };
 
         channel.send_message(&message).await
