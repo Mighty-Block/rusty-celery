@@ -1,10 +1,3 @@
-//! Defines mock broker that can be used to test other components that rely on a broker.
-//! Primero crear un topic en el emu
-//! curl -X PUT http://127.0.0.1:8538/v1/projects/emulator/topics/celery
-//! Producir un mensaje
-//! cargo run --example celery_app_gcp produce add
-//! Consumir
-//! cargo run --example celery_app_gcp consume
 use super::{Broker, BrokerBuilder};
 use crate::error::{BrokerError, ProtocolError};
 use crate::protocol::{self, Message, TryDeserializeMessage};
@@ -30,7 +23,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 // Internal pubsub message
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct PubsubMessage {
     data: String,
 
@@ -41,7 +34,7 @@ struct PubsubMessage {
     publish_time: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct ReceivedMessage {
     #[serde(rename(deserialize = "ackId"))]
     ack_id: String,
@@ -52,7 +45,7 @@ struct ReceivedMessage {
     message: PubsubMessage,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct PubsubPullResponse {
     #[serde(rename(deserialize = "receivedMessages"))]
     received_messages: Option<Vec<ReceivedMessage>>,
@@ -63,7 +56,7 @@ struct PubsubPullResponse {
 // The values is the suscription options for that topic.
 type BrokerTopicOptions = HashMap<String, BrokerSubscriptionOptions>;
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Clone, Debug, Default)]
 struct BrokerSubscriptionOptions {
     name: String,
     ack_deadline_seconds: Option<u16>,
@@ -75,7 +68,7 @@ pub enum GCPPubsubError {
     #[error("Request error: {0}")]
     RequestError(String),
 
-    #[error("Connection error")]
+    #[error("Client error: {0}")]
     RestClientError(#[from] reqwest::Error),
 }
 
@@ -132,14 +125,11 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
     }
 
     async fn build(&self, _connection_timeout: u32) -> Result<Self::Broker, BrokerError> {
-        // Base Url
-        let base_url = format!("{}/v1/projects/emulator", &self.config.broker_url);
-
         // Get topic subscription options
         let topics_subscriptions = Self::get_topic_subscription_options()?;
 
         Ok(GCPPubSubBroker {
-            base_url,
+            base_url: self.config.broker_url.clone(),
             topics_subscriptions,
             prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
             pending_tasks: Arc::new(AtomicU16::new(0)),
@@ -315,7 +305,7 @@ impl GCPChannel {
         let client = reqwest::ClientBuilder::new()
             .default_headers(default_headers)
             .build()
-            .expect("There was an error building the REST client for GCP");
+            .expect("There was an error building the REST client for GCP.");
 
         GCPChannel {
             connection: client,
@@ -352,7 +342,10 @@ impl GCPChannel {
             }
         };
 
-        let received_message = &deserealized_msg[0];
+        // let received_message = &deserealized_msg[0];
+        let received_message = deserealized_msg.get(0).ok_or_else(|| {
+            GCPPubsubError::RequestError("Invalid request body, received empty message".to_owned())
+        })?;
 
         let data = base64::decode(&received_message.message.data).map_err(|e| {
             BrokerError::IoError(std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
@@ -445,7 +438,7 @@ impl GCPChannel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct GCPDelivery {
     acknowledge_id: String,
     suscription: String,
