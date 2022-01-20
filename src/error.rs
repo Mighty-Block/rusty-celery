@@ -166,7 +166,7 @@ pub enum BrokerError {
 
     /// Any other GCP Pubsub error that could happen.
     #[error("GCP Pubsub error \"{0}\"")]
-    GCPPubsubError(#[from] reqwest::Error),
+    GCPPubsubError(#[from] crate::broker::GCPPubsubError),
 }
 
 impl BrokerError {

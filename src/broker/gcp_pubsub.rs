@@ -16,6 +16,7 @@ use futures::{
     Stream,
 };
 use log::warn;
+use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use std::io::{BufReader, ErrorKind};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
+use thiserror::Error;
 use uuid::Uuid;
 
 // Internal pubsub message
@@ -67,6 +69,17 @@ struct BrokerSubscriptionOptions {
     ack_deadline_seconds: Option<u16>,
 }
 
+// Broker Errors
+#[derive(Error, Debug)]
+pub enum GCPPubsubError {
+    #[error("Request error: {0}")]
+    RequestError(String),
+
+    #[error("Connection error")]
+    RestClientError(#[from] reqwest::Error),
+}
+
+// Broker builder
 struct Config {
     broker_url: String,
     prefetch_count: u16,
@@ -84,8 +97,8 @@ impl GCPPubSubBrokerBuilder {
             serde_json::from_reader(reader).map_err(BrokerError::DeserializeError)
         } else {
             warn!(
-                "No suscription configuration file defined in environment variable \"GCPPUBSUB_CONFIG\". \
-                The broker will only be able to send messages."
+                "No topics suscription configuration file defined in environment variable \
+                \"GCPPUBSUB_CONFIG\". The broker will only be able to send messages."
             );
             Ok(HashMap::new())
         }
@@ -122,6 +135,7 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         // Base Url
         let base_url = format!("{}/v1/projects/emulator", &self.config.broker_url);
 
+        // Get topic subscription options
         let topics_subscriptions = Self::get_topic_subscription_options()?;
 
         Ok(GCPPubSubBroker {
@@ -291,8 +305,20 @@ pub struct GCPChannel {
 
 impl GCPChannel {
     fn new(base_url: String, topic: String, subscription: BrokerSubscriptionOptions) -> Self {
+        // Build reqwest client
+        let mut default_headers = header::HeaderMap::new();
+        default_headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+
+        let client = reqwest::ClientBuilder::new()
+            .default_headers(default_headers)
+            .build()
+            .expect("There was an error building the REST client for GCP");
+
         GCPChannel {
-            connection: reqwest::Client::new(),
+            connection: client,
             base_url,
             topic,
             subscription,
@@ -302,7 +328,6 @@ impl GCPChannel {
     async fn pull_message(self) -> GCPConsumerOutput {
         // We have this loop in case the long polling request returns nothing. We just pull again
         let deserealized_msg = loop {
-            println!("Pulling messages...");
             let response = self
                 .connection
                 .post(format!(
@@ -310,12 +335,14 @@ impl GCPChannel {
                     &self.base_url, &self.subscription.name
                 ))
                 .body(r#"{ "maxMessages": 1 }"#)
-                .header("Content-Type", "application/json")
                 .send()
                 .await
-                .map_err(BrokerError::GCPPubsubError)?;
+                .map_err(GCPPubsubError::RestClientError)?;
 
-            let response_body = response.text().await.map_err(BrokerError::GCPPubsubError)?;
+            let response_body = response
+                .text()
+                .await
+                .map_err(GCPPubsubError::RestClientError)?;
 
             let deserialized = serde_json::from_str::<PubsubPullResponse>(&response_body)
                 .map_err(BrokerError::DeserializeError)?;
@@ -351,7 +378,7 @@ impl GCPChannel {
             .body((formatted_message.into_bytes()).to_vec())
             .send()
             .await
-            .map_err(BrokerError::GCPPubsubError)?;
+            .map_err(GCPPubsubError::RestClientError)?;
 
         Ok(())
     }
@@ -363,10 +390,9 @@ impl GCPChannel {
                 &self.base_url, &self.subscription.name
             ))
             .body(format!(r#"{{ "ackIds": [ "{}" ] }}"#, acknowledge_id))
-            .header("Content-Type", "application/json")
             .send()
             .await
-            .map_err(BrokerError::GCPPubsubError)?;
+            .map_err(GCPPubsubError::RestClientError)?;
 
         Ok(())
     }
@@ -385,16 +411,16 @@ impl GCPChannel {
                 r#"{{ "ackIds": [ "{}" ], "ackDeadlineSeconds": {} }}"#,
                 acknowledge_id, ack_deadline_seconds
             ))
-            .header("Content-Type", "application/json")
             .send()
             .await
-            .map_err(BrokerError::GCPPubsubError)?;
+            .map_err(GCPPubsubError::RestClientError)?;
 
         Ok(())
     }
 
     async fn subscribe_to_topic(&self) -> Result<(), BrokerError> {
-        self.connection
+        let response = self
+            .connection
             .put(format!(
                 "{}/subscriptions/{}",
                 &self.base_url, &self.subscription.name
@@ -403,10 +429,17 @@ impl GCPChannel {
                 r#"{{ "topic": "projects/emulator/topics/{}" }}"#,
                 &self.topic
             ))
-            .header("Content-Type", "application/json")
             .send()
             .await
-            .ok();
+            .map_err(GCPPubsubError::RestClientError)?;
+
+        if response.status() == 404 {
+            return Err(GCPPubsubError::RequestError(format!(
+                "Topic \"{}\" does not exist.",
+                &self.topic
+            ))
+            .into());
+        }
 
         Ok(())
     }

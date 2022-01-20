@@ -18,7 +18,7 @@ mod gcp_pubsub;
 mod redis;
 pub use self::redis::{RedisBroker, RedisBrokerBuilder};
 pub use amqp::{AMQPBroker, AMQPBrokerBuilder};
-pub use gcp_pubsub::{GCPPubSubBroker, GCPPubSubBrokerBuilder};
+pub use gcp_pubsub::{GCPPubSubBroker, GCPPubSubBrokerBuilder, GCPPubsubError};
 
 #[cfg(test)]
 pub mod mock;
