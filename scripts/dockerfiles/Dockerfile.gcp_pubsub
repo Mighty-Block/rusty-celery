@@ -1,0 +1,26 @@
+FROM openjdk:11-jre-slim-bullseye
+
+# Install necessary tools for pubsub
+RUN apt-get update
+RUN apt-get install -y wget python
+
+# Install gcloud
+ENV GCLOUD_OBJ=google-cloud-sdk-367.0.0-linux-x86_64.tar.gz
+RUN wget https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/$GCLOUD_OBJ
+RUN tar -xf $GCLOUD_OBJ -C /usr/local/
+ENV PATH=/usr/local/google-cloud-sdk/bin:$PATH
+RUN gcloud components install beta pubsub-emulator
+
+# Clean unused packages and apt cache
+RUN apt-get remove --purge -y wget
+RUN apt-get clean autoclean
+RUN apt-get autoremove --purge -y
+RUN rm -rf /var/lib/{apt,dpkg,cache,log}/
+
+EXPOSE 8538
+
+# Create staging area
+ADD ./ /mnt/data
+WORKDIR /mnt/data
+RUN mkdir gcd pubsub
+ENTRYPOINT gcloud beta emulators pubsub start --data-dir /mnt/data/pubsub --host-port 0.0.0.0:8538
