@@ -10,7 +10,7 @@ use futures::{
     task::{Context, Poll},
     Stream,
 };
-use log::warn;
+use log::{info, warn};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,6 +23,8 @@ use std::sync::Arc;
 use std::task::Waker;
 use thiserror::Error;
 use uuid::Uuid;
+
+const MESSAGE_TOPIC_NOT_EXIST: &str = "Topic does not exists";
 
 // Internal pubsub message
 #[derive(Serialize, Deserialize)]
@@ -305,7 +307,9 @@ impl Broker for GCPPubSubBroker {
             None => Some(1),
         };
 
-        channel.send_message(&message).await
+        // We do not process SendMessageResult because if we are retrying the message means the
+        // topic exists.
+        channel.send_message(&message).await.map(|_| ())
     }
 
     async fn send(&self, message: &Message, topic: &str) -> Result<(), BrokerError> {
@@ -317,7 +321,31 @@ impl Broker for GCPPubSubBroker {
             BrokerSubscriptionOptions::default(),
         );
 
-        channel.send_message(message).await
+        match channel.send_message(message).await {
+            Ok(SendMessageResult::MessageSent) => Ok(()),
+            Ok(SendMessageResult::TopicNotFound) => {
+                if let Some(true) = self.producer_options.create_topic {
+                    info!("Topic \"{}\" does not exist. Creating it...", topic);
+                    channel.create_topic().await?;
+                    // TODO: This nesting is horrible!
+                    match channel.send_message(message).await {
+                        Ok(SendMessageResult::MessageSent) => Ok(()),
+                        Ok(SendMessageResult::TopicNotFound) => Err(GCPPubsubError::RequestError(
+                            format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, topic),
+                        )
+                        .into()),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(GCPPubsubError::RequestError(format!(
+                        "{}: {}",
+                        MESSAGE_TOPIC_NOT_EXIST, topic
+                    ))
+                    .into())
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
@@ -354,6 +382,11 @@ impl Broker for GCPPubSubBroker {
 
         Ok(())
     }
+}
+
+enum SendMessageResult {
+    TopicNotFound,
+    MessageSent,
 }
 
 #[derive(Clone, Debug)]
@@ -433,18 +466,23 @@ impl GCPChannel {
         })
     }
 
-    async fn send_message(&self, message: &Message) -> Result<(), BrokerError> {
+    async fn send_message(&self, message: &Message) -> Result<SendMessageResult, BrokerError> {
         let message_payload = base64::encode(message.json_serialized()?);
         let formatted_message = json!({ "messages": [{ "data": message_payload }] }).to_string();
 
-        self.connection
+        let response = self
+            .connection
             .post(format!("{}/topics/{}:publish", &self.base_url, &self.topic))
             .body((formatted_message.into_bytes()).to_vec())
             .send()
             .await
             .map_err(GCPPubsubError::RestClientError)?;
 
-        Ok(())
+        if response.status() == 404 {
+            return Ok(SendMessageResult::TopicNotFound);
+        }
+
+        Ok(SendMessageResult::MessageSent)
     }
 
     async fn acknowledge(&self, acknowledge_id: String) -> Result<(), BrokerError> {
@@ -482,6 +520,16 @@ impl GCPChannel {
         Ok(())
     }
 
+    async fn create_topic(&self) -> Result<(), BrokerError> {
+        self.connection
+            .put(format!("{}/topics/{}", &self.base_url, &self.topic))
+            .send()
+            .await
+            .map_err(GCPPubsubError::RestClientError)?;
+
+        Ok(())
+    }
+
     async fn subscribe_to_topic(&self) -> Result<(), BrokerError> {
         let response = self
             .connection
@@ -499,8 +547,8 @@ impl GCPChannel {
 
         if response.status() == 404 {
             return Err(GCPPubsubError::RequestError(format!(
-                "Topic \"{}\" does not exist.",
-                &self.topic
+                "{}: {}",
+                MESSAGE_TOPIC_NOT_EXIST, &self.topic
             ))
             .into());
         }
