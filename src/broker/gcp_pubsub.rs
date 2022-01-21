@@ -1,3 +1,5 @@
+//! GCP Pubsub broker.
+
 use super::{Broker, BrokerBuilder};
 use crate::error::{BrokerError, ProtocolError};
 use crate::protocol::{self, Message, TryDeserializeMessage};
@@ -51,18 +53,69 @@ struct PubsubPullResponse {
     received_messages: Option<Vec<ReceivedMessage>>,
 }
 
-// Subscription configuration for topics.
-// The key is the topic name.
-// The values is the suscription options for that topic.
+//
+// Broker configuration structs.
+//
+
+// General
+#[derive(Deserialize, Clone, Debug)]
+struct BrokerOptions {
+    producer: Option<BrokerProducerOptions>,
+
+    consumer: Option<BrokerConsumerOptions>,
+}
+
+impl Default for BrokerOptions {
+    fn default() -> Self {
+        Self {
+            producer: Some(BrokerProducerOptions::default()),
+            consumer: Some(BrokerConsumerOptions::default()),
+        }
+    }
+}
+
+// Producer
+#[derive(Deserialize, Clone, Debug)]
+struct BrokerProducerOptions {
+    create_topic: Option<bool>,
+}
+
+impl Default for BrokerProducerOptions {
+    fn default() -> Self {
+        Self {
+            create_topic: Some(true),
+        }
+    }
+}
+
+// Consumer
+#[derive(Deserialize, Clone, Debug)]
+struct BrokerConsumerOptions {
+    create_default_subscription: Option<bool>,
+    topics: Option<BrokerTopicOptions>,
+}
+
+impl Default for BrokerConsumerOptions {
+    fn default() -> Self {
+        Self {
+            create_default_subscription: Some(false),
+            topics: None,
+        }
+    }
+}
+
 type BrokerTopicOptions = HashMap<String, BrokerSubscriptionOptions>;
 
 #[derive(Deserialize, Clone, Debug, Default)]
 struct BrokerSubscriptionOptions {
+    #[serde(rename(deserialize = "subscription_name"))]
     name: String,
     ack_deadline_seconds: Option<u16>,
 }
 
+//
 // Broker Errors
+//
 #[derive(Error, Debug)]
 pub enum GCPPubsubError {
     #[error("Request error: {0}")]
@@ -83,17 +136,17 @@ pub struct GCPPubSubBrokerBuilder {
 }
 
 impl GCPPubSubBrokerBuilder {
-    fn get_topic_subscription_options() -> Result<BrokerTopicOptions, BrokerError> {
+    fn get_broker_configuration() -> Result<BrokerOptions, BrokerError> {
         if let Ok(config_file_path) = std::env::var("GCPPUBSUB_CONFIG") {
             let config_file = File::open(config_file_path).map_err(BrokerError::IoError)?;
             let reader = BufReader::new(config_file);
             serde_json::from_reader(reader).map_err(BrokerError::DeserializeError)
         } else {
             warn!(
-                "No topics suscription configuration file defined in environment variable \
-                \"GCPPUBSUB_CONFIG\". The broker will only be able to send messages."
+                "No configuration file defined in environment variable \"GCPPUBSUB_CONFIG\". \
+                 Using default values."
             );
-            Ok(HashMap::new())
+            Ok(BrokerOptions::default())
         }
     }
 }
@@ -124,13 +177,15 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         self
     }
 
+    // TODO: Check if we can configure the rest clioent with timeout
     async fn build(&self, _connection_timeout: u32) -> Result<Self::Broker, BrokerError> {
         // Get topic subscription options
-        let topics_subscriptions = Self::get_topic_subscription_options()?;
+        let broker_configuration = Self::get_broker_configuration()?;
 
         Ok(GCPPubSubBroker {
             base_url: self.config.broker_url.clone(),
-            topics_subscriptions,
+            producer_options: broker_configuration.producer.unwrap_or_default(),
+            consumer_options: broker_configuration.consumer.unwrap_or_default(),
             prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
             pending_tasks: Arc::new(AtomicU16::new(0)),
         })
@@ -140,8 +195,9 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
 pub struct GCPPubSubBroker {
     base_url: String,
 
-    // Topics used as consumers through subscriptions
-    topics_subscriptions: BrokerTopicOptions,
+    consumer_options: BrokerConsumerOptions,
+
+    producer_options: BrokerProducerOptions,
 
     prefetch_count: Arc<AtomicU16>,
 
@@ -164,10 +220,25 @@ impl Broker for GCPPubSubBroker {
         topic: &str,
         error_handler: Box<E>,
     ) -> Result<(String, Self::DeliveryStream), BrokerError> {
-        // Suscribe to topics
-        let suscription_options = self.topics_subscriptions.get(topic);
+        let create_default_subscription = self.consumer_options.create_default_subscription;
 
-        if let Some(subscription) = suscription_options {
+        // Get the topic subscription... if there is one
+        let topic_subscription = match &self.consumer_options.topics {
+            Some(topic_subscriptions) => topic_subscriptions.get(topic),
+            _ => None,
+        };
+
+        // Get the subscription depending on the options
+        let subscription_options = match (topic_subscription, create_default_subscription) {
+            (Some(subscription), _) => Some(subscription.to_owned()),
+            (None, Some(true)) => Some(BrokerSubscriptionOptions {
+                name: format!("{}_default_subscription", topic),
+                ..BrokerSubscriptionOptions::default()
+            }),
+            _ => None,
+        };
+
+        if let Some(subscription) = subscription_options {
             // Create unique consumer tag.
             let mut buffer = Uuid::encode_buffer();
             let uuid = Uuid::new_v4().to_hyphenated().encode_lower(&mut buffer);
@@ -305,7 +376,7 @@ impl GCPChannel {
         let client = reqwest::ClientBuilder::new()
             .default_headers(default_headers)
             .build()
-            .expect("There was an error building the REST client for GCP.");
+            .expect("There was an error building the REST client for GCP Pubsub.");
 
         GCPChannel {
             connection: client,
@@ -342,7 +413,7 @@ impl GCPChannel {
             }
         };
 
-        // let received_message = &deserealized_msg[0];
+        // This error should never happen...
         let received_message = deserealized_msg.get(0).ok_or_else(|| {
             GCPPubsubError::RequestError("Invalid request body, received empty message".to_owned())
         })?;
