@@ -23,4 +23,4 @@ EXPOSE 8538
 ADD ./ /mnt/data
 WORKDIR /mnt/data
 RUN mkdir gcd pubsub
-ENTRYPOINT gcloud beta emulators pubsub start --data-dir /mnt/data/pubsub --host-port 0.0.0.0:8538
+ENTRYPOINT gcloud beta emulators pubsub start --data-dir /mnt/data/pubsub --host-port 0.0.0.0:8538 --project=celery

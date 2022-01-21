@@ -36,6 +36,7 @@ test :
 broker-tests :
 	@cargo test --test integrations brokers::amqp
 	@cargo test --test integrations brokers::redis
+	@cargo test --test integrations brokers::gcp_pubsub
 
 .PHONY : run-all-tests
 run-all-tests :
@@ -46,6 +47,7 @@ run-all-tests :
 	@cargo test --no-run --test codegen beat_codegen
 	@cargo test --test integrations brokers::amqp
 	@cargo test --test integrations brokers::redis
+	@cargo test --test integrations brokers::gcp_pubsub
 
 .PHONY : build-docs
 build-docs :
