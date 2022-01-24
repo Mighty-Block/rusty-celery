@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
 use thiserror::Error;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::RwLock;
+use tokio::{select, try_join};
 use uuid::Uuid;
 
 const MESSAGE_TOPIC_NOT_EXIST: &str = "Topic does not exists";
@@ -190,6 +193,7 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
             consumer_options: broker_configuration.consumer.unwrap_or_default(),
             prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
             pending_tasks: Arc::new(AtomicU16::new(0)),
+            consumers: RwLock::new(HashMap::new()),
         })
     }
 }
@@ -204,6 +208,8 @@ pub struct GCPPubSubBroker {
     prefetch_count: Arc<AtomicU16>,
 
     pending_tasks: Arc<AtomicU16>,
+
+    consumers: RwLock<HashMap<String, Sender<()>>>,
 }
 
 #[async_trait]
@@ -256,12 +262,20 @@ impl Broker for GCPPubSubBroker {
             // Susbcribe to the topic with the given subscription
             gcp_channel.subscribe_to_topic().await?;
 
+            // Create a oneshot channel to communicate to the consumer that it has been cancelled
+            // (due to a shutdown)
+            let (sx, rx): (Sender<()>, Receiver<()>) = channel(1);
+            let mut consumers = self.consumers.write().await;
+            consumers.insert(consumer_tag.clone(), sx);
+
             let consumer = GCPConsumer {
+                cancellation_receiver: rx,
                 pending_tasks: self.pending_tasks.clone(),
                 prefetch_count: self.prefetch_count.clone(),
                 polled_pop: None,
                 channel: gcp_channel,
                 error_handler,
+                stop_polling: false,
             };
 
             Ok((consumer_tag, consumer))
@@ -273,7 +287,14 @@ impl Broker for GCPPubSubBroker {
         }
     }
 
-    async fn cancel(&self, _consumer_tag: &str) -> Result<(), BrokerError> {
+    async fn cancel(&self, consumer_tag: &str) -> Result<(), BrokerError> {
+        println!("Shutting down {}", consumer_tag);
+        let consumers = self.consumers.read().await;
+        if let Some(sender) = consumers.get(consumer_tag) {
+            let res = sender.send(()).await;
+            println!("Send result {:?}", res);
+        }
+
         Ok(())
     }
 
@@ -331,7 +352,11 @@ impl Broker for GCPPubSubBroker {
                     match channel.send_message(message).await {
                         Ok(SendMessageResult::MessageSent) => Ok(()),
                         Ok(SendMessageResult::TopicNotFound) => Err(GCPPubsubError::RequestError(
-                            format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, topic),
+                            format!(
+                                "{}: {}. Check if the service is working correctly because we created it just before sending the message.",
+                                MESSAGE_TOPIC_NOT_EXIST,
+                                topic
+                            ),
                         )
                         .into()),
                         Err(e) => Err(e),
@@ -395,6 +420,7 @@ pub struct GCPChannel {
     base_url: String,
     topic: String,
     subscription: BrokerSubscriptionOptions,
+    stop_polling: bool,
 }
 
 impl GCPChannel {
@@ -416,20 +442,23 @@ impl GCPChannel {
             base_url,
             topic,
             subscription,
+            stop_polling: false,
         }
     }
 
     async fn pull_message(self) -> GCPConsumerOutput {
         // We have this loop in case the long polling request returns nothing. We just pull again
         let deserealized_msg = loop {
-            let response = self
+            let long_poll_request = self
                 .connection
                 .post(format!(
                     "{}/subscriptions/{}:pull",
                     &self.base_url, &self.subscription.name
                 ))
                 .body(r#"{ "maxMessages": 1 }"#)
-                .send()
+                .send();
+
+            let response = long_poll_request
                 .await
                 .map_err(GCPPubsubError::RestClientError)?;
 
@@ -575,17 +604,72 @@ type GCPConsumerOutput = Result<GCPDelivery, BrokerError>;
 type GCPConsumerOutputFuture = Box<dyn Future<Output = Result<GCPDelivery, BrokerError>>>;
 
 pub struct GCPConsumer {
+    cancellation_receiver: Receiver<()>,
     pending_tasks: Arc<AtomicU16>,
     prefetch_count: Arc<AtomicU16>,
     channel: GCPChannel,
     polled_pop: Option<std::pin::Pin<GCPConsumerOutputFuture>>,
     error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
+    stop_polling: bool,
+}
+
+impl GCPConsumer {
+    fn check_consumer_shutdown(&mut self) -> Result<bool, BrokerError> {
+        match self.cancellation_receiver.try_recv() {
+            Ok(()) => {
+                info!(
+                    "Cancelling polling of messages for \"{}\".",
+                    self.channel.topic
+                );
+                self.stop_polling = true;
+                Ok(true)
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                println!("Empty");
+                Ok(false)
+            }
+            Err(_) => {
+                println!("Error cancelling?");
+                Err(GCPPubsubError::RequestError(
+                    "There was an error cancelling the consumer".to_string(),
+                )
+                .into())
+            }
+        }
+    }
+
+    /*
+    async fn test(&mut self) -> std::pin::Pin<GCPConsumerOutputFuture> {
+        let mut polled_message: std::pin::Pin<GCPConsumerOutputFuture>;
+        if self.polled_pop.is_none() {
+            select!(
+                maybe_cancelled = self.cancellation_receiver.recv() => {
+                    match maybe_cancelled {
+                        Some(()) => {},
+                        None => {}
+                    }
+                },
+                polled_msg = self.channel.clone().pull_message() => {
+                    polled_message = Box::pin(polled_msg);
+                }
+            );
+        } else {
+            polled_message = self.polled_pop.take().unwrap();
+        }
+
+        polled_message
+    }*/
 }
 
 impl Stream for GCPConsumer {
     type Item = Result<(GCPChannel, GCPDelivery), BrokerError>;
 
     fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        // If we got cancelled, we just return a pending forever.
+        if self.stop_polling {
+            return Poll::Pending;
+        }
+
         // If we have more pending tasks than the prefetch count, we leave them pending until we
         // can process them...
         if self.pending_tasks.load(Ordering::SeqCst) >= self.prefetch_count.load(Ordering::SeqCst)
@@ -593,6 +677,11 @@ impl Stream for GCPConsumer {
         {
             // If acks_late is true, this Pending is waken up by the ack function when a pending
             // task is terminated!
+            return Poll::Pending;
+        }
+
+        // Check if the consumer shat down before pulling...
+        if let Ok(true) = self.check_consumer_shutdown() {
             return Poll::Pending;
         }
 
@@ -604,6 +693,12 @@ impl Stream for GCPConsumer {
             // It is safe to unwrap here since we have the is_none in the if branch
             self.polled_pop.take().unwrap()
         };
+
+        // And check if the consumer shat down after pulling... So we do not process the task from
+        // this message
+        if let Ok(true) = self.check_consumer_shutdown() {
+            return Poll::Pending;
+        }
 
         // To execute the pull_message function, since it is an async Task we have to Poll it.
         //
