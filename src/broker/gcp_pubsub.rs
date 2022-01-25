@@ -249,7 +249,6 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
         self
     }
 
-    // TODO: Check if we can configure the rest clioent with timeout
     async fn build(&self, _connection_timeout: u32) -> Result<Self::Broker, BrokerError> {
         // Get topic subscription options
         let broker_configuration = Self::get_broker_configuration()?;

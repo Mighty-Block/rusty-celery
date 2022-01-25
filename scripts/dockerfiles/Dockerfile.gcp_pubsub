@@ -15,6 +15,7 @@ RUN gcloud components install beta pubsub-emulator
 RUN apt-get remove --purge -y wget
 RUN apt-get clean autoclean
 RUN apt-get autoremove --purge -y
+RUN rm -rf /$GCLOUD_OBJ
 RUN rm -rf /var/lib/{apt,dpkg,cache,log}/
 
 EXPOSE 8538

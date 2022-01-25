@@ -1,0 +1,43 @@
+{
+  "producer": {
+    "create_topic": true
+  },
+  "consumer": {
+    "create_default_subscription": true,
+    "topics": {
+      "celery": {
+        "subscription_name": "celery_subscription"
+      },
+      "buggy-queue": {
+        "subscription_name": "buggy_queue_subscription"
+      },
+      "topic_name": {
+        "subscription_name": "all_subscription_options_example",
+        "ack_deadline_seconds": 25,
+        "retain_acked_messages": true,
+        "message_retain_duration": "3.5s",
+        "labels": {
+          "label1": "value_one",
+          "label2": "value_two",
+          "label3": "value_three",
+          "label4": "value_four"
+        },
+        "enable_message_ordering": true,
+        "expiration_policy": {
+          "ttl": "60s"
+        },
+        "filter": "attributes.\"iana.org/language_tag\" = \"en\"",
+        "dead_letter_policy": {
+          "dead_letter_topic": "projects/celery/topics/celery-deadletter",
+          "max_delivery_attempts": 5
+        },
+        "retry_policy": {
+          "minimum_backoff": "1s",
+          "maximum_backoff": "20s"
+        },
+        "detached": false,
+        "topic_message_retention_duration": "5s"
+      }
+    }
+  }
+}
