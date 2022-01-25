@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
 use thiserror::Error;
+use tokio::select;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::RwLock;
-use tokio::{select, try_join};
 use uuid::Uuid;
 
 const MESSAGE_TOPIC_NOT_EXIST: &str = "Topic does not exists";
@@ -252,24 +252,24 @@ impl Broker for GCPPubSubBroker {
             let uuid = Uuid::new_v4().to_hyphenated().encode_lower(&mut buffer);
             let consumer_tag = uuid.to_owned();
 
-            // Create the channel
-            let gcp_channel = GCPChannel::new(
-                self.base_url.clone(),
-                topic.to_string(),
-                subscription.clone(),
-            );
-
-            // Susbcribe to the topic with the given subscription
-            gcp_channel.subscribe_to_topic().await?;
-
             // Create a oneshot channel to communicate to the consumer that it has been cancelled
             // (due to a shutdown)
             let (sx, rx): (Sender<()>, Receiver<()>) = channel(1);
             let mut consumers = self.consumers.write().await;
             consumers.insert(consumer_tag.clone(), sx);
 
+            // Create the channel
+            let gcp_channel = GCPChannel::new(
+                self.base_url.clone(),
+                topic.to_string(),
+                subscription.clone(),
+                Some(rx),
+            );
+
+            // Susbcribe to the topic with the given subscription
+            gcp_channel.subscribe_to_topic().await?;
+
             let consumer = GCPConsumer {
-                cancellation_receiver: rx,
                 pending_tasks: self.pending_tasks.clone(),
                 prefetch_count: self.prefetch_count.clone(),
                 polled_pop: None,
@@ -340,6 +340,7 @@ impl Broker for GCPPubSubBroker {
             self.base_url.clone(),
             topic.to_string(),
             BrokerSubscriptionOptions::default(),
+            None,
         );
 
         match channel.send_message(message).await {
@@ -421,10 +422,16 @@ pub struct GCPChannel {
     topic: String,
     subscription: BrokerSubscriptionOptions,
     stop_polling: bool,
+    cancel_reciever: Option<Arc<RwLock<Receiver<()>>>>,
 }
 
 impl GCPChannel {
-    fn new(base_url: String, topic: String, subscription: BrokerSubscriptionOptions) -> Self {
+    fn new(
+        base_url: String,
+        topic: String,
+        subscription: BrokerSubscriptionOptions,
+        cancel_reciever: Option<Receiver<()>>,
+    ) -> Self {
         // Build reqwest client
         let mut default_headers = header::HeaderMap::new();
         default_headers.insert(
@@ -437,62 +444,99 @@ impl GCPChannel {
             .build()
             .expect("There was an error building the REST client for GCP Pubsub.");
 
+        let receiver = cancel_reciever.map(|r| Arc::new(RwLock::new(r)));
+
         GCPChannel {
             connection: client,
             base_url,
             topic,
             subscription,
             stop_polling: false,
+            cancel_reciever: receiver,
         }
     }
 
-    async fn pull_message(self) -> GCPConsumerOutput {
+    async fn fetch_message(&self) -> Result<PubsubPullResponse, BrokerError> {
+        println!("1 Fetch...");
+        let long_poll_response = self
+            .connection
+            .post(format!(
+                "{}/subscriptions/{}:pull",
+                &self.base_url, &self.subscription.name
+            ))
+            .body(r#"{ "maxMessages": 1 }"#)
+            .send()
+            .await
+            .map_err(GCPPubsubError::RestClientError)?;
+
+        println!("2 Fetch...");
+        let response_body = long_poll_response
+            .text()
+            .await
+            .map_err(GCPPubsubError::RestClientError)?;
+
+        println!("Exit fetch...");
+        Ok(serde_json::from_str::<PubsubPullResponse>(&response_body)
+            .map_err(BrokerError::DeserializeError)?)
+    }
+
+    async fn pull_message(mut self) -> GCPConsumerOutput {
+        if self.stop_polling {
+            warn!(
+                "Tried to pull messages from a cancelled consumer/channel for topic \"{}\",",
+                &self.topic
+            );
+            return Ok(GCPConsumerOutputOperation::StopPolling);
+        }
+
         // We have this loop in case the long polling request returns nothing. We just pull again
-        let deserealized_msg = loop {
-            let long_poll_request = self
-                .connection
-                .post(format!(
-                    "{}/subscriptions/{}:pull",
-                    &self.base_url, &self.subscription.name
-                ))
-                .body(r#"{ "maxMessages": 1 }"#)
-                .send();
-
-            let response = long_poll_request
-                .await
-                .map_err(GCPPubsubError::RestClientError)?;
-
-            let response_body = response
-                .text()
-                .await
-                .map_err(GCPPubsubError::RestClientError)?;
-
-            let deserialized = serde_json::from_str::<PubsubPullResponse>(&response_body)
-                .map_err(BrokerError::DeserializeError)?;
-
-            if let Some(messages) = deserialized.received_messages {
-                break messages;
-            }
+        let mut cancel_receiver = self.cancel_reciever.as_ref().unwrap().write().await;
+        let received_messages = loop {
+            select! {
+               new_message = self.fetch_message() => {
+                    println!("fetch inside select...");
+                    if let Ok(message) = new_message {
+                        if let Some(msg) = message.received_messages {
+                            break Some(msg);
+                        }
+                    }
+                },
+                cancel = cancel_receiver.recv() => {
+                    info!("Cancel signal received, shutting down channel/consumer for topic \"{}\".", &self.topic);
+                    break None;
+                }
+            };
         };
 
-        // This error should never happen...
-        let received_message = deserealized_msg.get(0).ok_or_else(|| {
-            GCPPubsubError::RequestError("Invalid request body, received empty message".to_owned())
-        })?;
+        match received_messages {
+            // This branch is where we process the received message
+            Some(deserialized_message) => {
+                let received_message = deserialized_message.get(0).ok_or_else(|| {
+                    GCPPubsubError::RequestError(
+                        "Invalid request body, received empty message".to_owned(),
+                    )
+                })?;
 
-        let data = base64::decode(&received_message.message.data).map_err(|e| {
-            BrokerError::IoError(std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
-        })?;
+                let data = base64::decode(&received_message.message.data).map_err(|e| {
+                    BrokerError::IoError(std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
+                })?;
 
-        let delivery: protocol::Delivery =
-            serde_json::from_slice(&data).map_err(BrokerError::DeserializeError)?;
+                let delivery: protocol::Delivery =
+                    serde_json::from_slice(&data).map_err(BrokerError::DeserializeError)?;
 
-        Ok(GCPDelivery {
-            acknowledge_id: received_message.ack_id.clone(),
-            suscription: self.subscription.name,
-            waker: None,
-            delivery,
-        })
+                Ok(GCPConsumerOutputOperation::PolledMessage(GCPDelivery {
+                    acknowledge_id: received_message.ack_id.clone(),
+                    suscription: self.subscription.name,
+                    waker: None,
+                    delivery,
+                }))
+            }
+            // This branch process the consumer/channel cancellation
+            None => {
+                self.stop_polling = true;
+                Ok(GCPConsumerOutputOperation::StopPolling)
+            }
+        }
     }
 
     async fn send_message(&self, message: &Message) -> Result<SendMessageResult, BrokerError> {
@@ -600,11 +644,15 @@ impl TryDeserializeMessage for (GCPChannel, GCPDelivery) {
     }
 }
 
-type GCPConsumerOutput = Result<GCPDelivery, BrokerError>;
-type GCPConsumerOutputFuture = Box<dyn Future<Output = Result<GCPDelivery, BrokerError>>>;
+enum GCPConsumerOutputOperation {
+    PolledMessage(GCPDelivery),
+    StopPolling,
+}
+
+type GCPConsumerOutput = Result<GCPConsumerOutputOperation, BrokerError>;
+type GCPConsumerOutputFuture = Box<dyn Future<Output = GCPConsumerOutput>>;
 
 pub struct GCPConsumer {
-    cancellation_receiver: Receiver<()>,
     pending_tasks: Arc<AtomicU16>,
     prefetch_count: Arc<AtomicU16>,
     channel: GCPChannel,
@@ -613,59 +661,12 @@ pub struct GCPConsumer {
     stop_polling: bool,
 }
 
-impl GCPConsumer {
-    fn check_consumer_shutdown(&mut self) -> Result<bool, BrokerError> {
-        match self.cancellation_receiver.try_recv() {
-            Ok(()) => {
-                info!(
-                    "Cancelling polling of messages for \"{}\".",
-                    self.channel.topic
-                );
-                self.stop_polling = true;
-                Ok(true)
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                println!("Empty");
-                Ok(false)
-            }
-            Err(_) => {
-                println!("Error cancelling?");
-                Err(GCPPubsubError::RequestError(
-                    "There was an error cancelling the consumer".to_string(),
-                )
-                .into())
-            }
-        }
-    }
-
-    /*
-    async fn test(&mut self) -> std::pin::Pin<GCPConsumerOutputFuture> {
-        let mut polled_message: std::pin::Pin<GCPConsumerOutputFuture>;
-        if self.polled_pop.is_none() {
-            select!(
-                maybe_cancelled = self.cancellation_receiver.recv() => {
-                    match maybe_cancelled {
-                        Some(()) => {},
-                        None => {}
-                    }
-                },
-                polled_msg = self.channel.clone().pull_message() => {
-                    polled_message = Box::pin(polled_msg);
-                }
-            );
-        } else {
-            polled_message = self.polled_pop.take().unwrap();
-        }
-
-        polled_message
-    }*/
-}
-
 impl Stream for GCPConsumer {
     type Item = Result<(GCPChannel, GCPDelivery), BrokerError>;
 
     fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        // If we got cancelled, we just return a pending forever.
+        // If we got cancelled, we just return a pending forever. The consumer will die when the
+        // program shuts down.
         if self.stop_polling {
             return Poll::Pending;
         }
@@ -680,11 +681,6 @@ impl Stream for GCPConsumer {
             return Poll::Pending;
         }
 
-        // Check if the consumer shat down before pulling...
-        if let Ok(true) = self.check_consumer_shutdown() {
-            return Poll::Pending;
-        }
-
         // If the polled_pop is None, means we have to pull a message from the queue, otherwise we
         // have a Future that can be Resolved or Pending
         let mut polled_message = if self.polled_pop.is_none() {
@@ -693,12 +689,6 @@ impl Stream for GCPConsumer {
             // It is safe to unwrap here since we have the is_none in the if branch
             self.polled_pop.take().unwrap()
         };
-
-        // And check if the consumer shat down after pulling... So we do not process the task from
-        // this message
-        if let Ok(true) = self.check_consumer_shutdown() {
-            return Poll::Pending;
-        }
 
         // To execute the pull_message function, since it is an async Task we have to Poll it.
         //
@@ -710,10 +700,14 @@ impl Stream for GCPConsumer {
         // If it is NOT Ready: Put the Future inside the Option again and return the Pending state
         if let Poll::Ready(item) = Future::poll(polled_message.as_mut(), cx) {
             match item {
-                Ok(mut item) => {
+                Ok(GCPConsumerOutputOperation::PolledMessage(mut item)) => {
                     self.pending_tasks.fetch_add(1, Ordering::SeqCst);
                     item.waker = Some(cx.waker().clone());
                     Poll::Ready(Some(Ok((self.channel.clone(), item))))
+                }
+                Ok(GCPConsumerOutputOperation::StopPolling) => {
+                    self.stop_polling = true;
+                    Poll::Pending
                 }
                 Err(err) => {
                     (self.error_handler)(err);
