@@ -10,7 +10,7 @@ use futures::{
     task::{Context, Poll},
     Stream,
 };
-use log::{info, warn};
+use log::{error, info, warn};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -24,7 +24,7 @@ use std::task::Waker;
 use thiserror::Error;
 use uuid::Uuid;
 
-const MESSAGE_TOPIC_NOT_EXIST: &str = "Topic does not exists";
+const MESSAGE_TOPIC_NOT_EXIST: &str = "There was an error with the following topic";
 
 // Internal pubsub message
 #[derive(Serialize, Deserialize)]
@@ -76,6 +76,16 @@ impl Default for BrokerOptions {
     }
 }
 
+#[derive(Deserialize)]
+struct GCPErrorMessage {
+    error: GCPErrorDetail,
+}
+
+#[derive(Deserialize)]
+struct GCPErrorDetail {
+    message: String,
+}
+
 // Producer
 #[derive(Deserialize, Clone, Debug)]
 struct BrokerProducerOptions {
@@ -106,13 +116,70 @@ impl Default for BrokerConsumerOptions {
     }
 }
 
-type BrokerTopicOptions = HashMap<String, BrokerSubscriptionOptions>;
+type BrokerTopicOptions = HashMap<String, BrokerSubscription>;
 
-#[derive(Deserialize, Clone, Debug, Default)]
-struct BrokerSubscriptionOptions {
-    #[serde(rename(deserialize = "subscription_name"))]
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct BrokerSuscriptionExpirationPolicy {
+    ttl: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all(serialize = "camelCase"))]
+struct BrokerSuscriptionDeadLetterPolicy {
+    dead_letter_topic: String,
+
+    max_delivery_attempts: u8,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all(serialize = "camelCase"))]
+struct BrokerSuscriptionRetryPolicy {
+    minimum_backoff: String,
+
+    maximum_backoff: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all(serialize = "camelCase"))]
+struct BrokerSubscription {
+    #[serde(rename(deserialize = "subscription_name"), skip_serializing)]
     name: String,
+
+    #[serde(skip_deserializing)]
+    topic: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     ack_deadline_seconds: Option<u16>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retain_acked_messages: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_retention_duration: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_message_ordering: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiration_policy: Option<BrokerSuscriptionExpirationPolicy>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dead_letter_policy: Option<BrokerSuscriptionDeadLetterPolicy>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_policy: Option<BrokerSuscriptionRetryPolicy>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detached: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic_message_retention_duration: Option<String>,
 }
 
 //
@@ -122,6 +189,9 @@ struct BrokerSubscriptionOptions {
 pub enum GCPPubsubError {
     #[error("Request error: {0}")]
     RequestError(String),
+
+    #[error("Unknown error: {0}")]
+    UnknownError(String),
 
     #[error("Client error: {0}")]
     RestClientError(#[from] reqwest::Error),
@@ -183,6 +253,10 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
     async fn build(&self, _connection_timeout: u32) -> Result<Self::Broker, BrokerError> {
         // Get topic subscription options
         let broker_configuration = Self::get_broker_configuration()?;
+        let project = self.config.broker_url.split('/').collect::<Vec<&str>>();
+        let project = project
+            .last()
+            .expect("Unable to get the GCP project from the Url");
 
         Ok(GCPPubSubBroker {
             base_url: self.config.broker_url.clone(),
@@ -190,12 +264,15 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
             consumer_options: broker_configuration.consumer.unwrap_or_default(),
             prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
             pending_tasks: Arc::new(AtomicU16::new(0)),
+            gcp_project: project.to_string(),
         })
     }
 }
 
 pub struct GCPPubSubBroker {
     base_url: String,
+
+    gcp_project: String,
 
     consumer_options: BrokerConsumerOptions,
 
@@ -233,14 +310,17 @@ impl Broker for GCPPubSubBroker {
         // Get the subscription depending on the options
         let subscription_options = match (topic_subscription, create_default_subscription) {
             (Some(subscription), _) => Some(subscription.to_owned()),
-            (None, Some(true)) => Some(BrokerSubscriptionOptions {
+            (None, Some(true)) => Some(BrokerSubscription {
                 name: format!("{}_default_subscription", topic),
-                ..BrokerSubscriptionOptions::default()
+                ..BrokerSubscription::default()
             }),
             _ => None,
         };
 
-        if let Some(subscription) = subscription_options {
+        if let Some(mut subscription) = subscription_options {
+            // Set the topic related to the subscription
+            subscription.topic = format!("projects/{}/topics/{}", self.gcp_project, topic);
+
             // Create unique consumer tag.
             let mut buffer = Uuid::encode_buffer();
             let uuid = Uuid::new_v4().to_hyphenated().encode_lower(&mut buffer);
@@ -267,7 +347,7 @@ impl Broker for GCPPubSubBroker {
             Ok((consumer_tag, consumer))
         } else {
             Err(BrokerError::UnknownQueue(format!(
-                "There is no subscription configuration for topic \"{}\"",
+                "There is no subscription configuration for topic \"{}\".",
                 topic
             )))
         }
@@ -318,7 +398,7 @@ impl Broker for GCPPubSubBroker {
         let channel = GCPChannel::new(
             self.base_url.clone(),
             topic.to_string(),
-            BrokerSubscriptionOptions::default(),
+            BrokerSubscription::default(),
         );
 
         match channel.send_message(message).await {
@@ -327,6 +407,7 @@ impl Broker for GCPPubSubBroker {
                 if let Some(true) = self.producer_options.create_topic {
                     info!("Topic \"{}\" does not exist. Creating it...", topic);
                     channel.create_topic().await?;
+
                     // TODO: This nesting is horrible!
                     match channel.send_message(message).await {
                         Ok(SendMessageResult::MessageSent) => Ok(()),
@@ -394,11 +475,14 @@ pub struct GCPChannel {
     connection: reqwest::Client,
     base_url: String,
     topic: String,
-    subscription: BrokerSubscriptionOptions,
+    subscription: BrokerSubscription,
 }
 
 impl GCPChannel {
-    fn new(base_url: String, topic: String, subscription: BrokerSubscriptionOptions) -> Self {
+    const ERROR_GCP_ERROR_MESSAGE_PARSE: &'static str =
+        "There was an error parsing a GCP Error Response";
+
+    fn new(base_url: String, topic: String, subscription: BrokerSubscription) -> Self {
         // Build reqwest client
         let mut default_headers = header::HeaderMap::new();
         default_headers.insert(
@@ -473,7 +557,7 @@ impl GCPChannel {
         let response = self
             .connection
             .post(format!("{}/topics/{}:publish", &self.base_url, &self.topic))
-            .body((formatted_message.into_bytes()).to_vec())
+            .body(formatted_message)
             .send()
             .await
             .map_err(GCPPubsubError::RestClientError)?;
@@ -531,29 +615,61 @@ impl GCPChannel {
     }
 
     async fn subscribe_to_topic(&self) -> Result<(), BrokerError> {
-        let response = self
-            .connection
-            .put(format!(
-                "{}/subscriptions/{}",
-                &self.base_url, &self.subscription.name
-            ))
-            .body(format!(
-                r#"{{ "topic": "projects/emulator/topics/{}" }}"#,
-                &self.topic
-            ))
-            .send()
-            .await
-            .map_err(GCPPubsubError::RestClientError)?;
+        match serde_json::to_string(&self.subscription) {
+            Ok(subscription_json) => {
+                let response = self
+                    .connection
+                    .put(format!(
+                        "{}/subscriptions/{}",
+                        &self.base_url, &self.subscription.name
+                    ))
+                    .body(subscription_json)
+                    .send()
+                    .await
+                    .map_err(GCPPubsubError::RestClientError)?;
 
-        if response.status() == 404 {
-            return Err(GCPPubsubError::RequestError(format!(
-                "{}: {}",
-                MESSAGE_TOPIC_NOT_EXIST, &self.topic
-            ))
-            .into());
+                if response.status() == 404 {
+                    let error_message = match self.get_deserialized_error(response).await {
+                        Some(e) => format!("{}: {}\n{}", MESSAGE_TOPIC_NOT_EXIST, &self.topic, e.message),
+                        None => format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, &self.topic),
+                    };
+
+                    return Err(GCPPubsubError::RequestError(error_message).into());
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                Err(GCPPubsubError::UnknownError(format!(
+                    "There was an error parsing the subscription options for topic \"{}\". Please check the configuration.\n{}",
+                    &self.topic,
+                    e.to_string()
+                ))
+                .into())
+            }
         }
+    }
 
-        Ok(())
+    async fn get_deserialized_error(&self, response: reqwest::Response) -> Option<GCPErrorDetail> {
+        let response_body = response.text().await;
+
+        match response_body {
+            Ok(body) => {
+                let deserialized_error = serde_json::from_str::<GCPErrorMessage>(&body);
+
+                match deserialized_error {
+                    Ok(error) => Some(error.error),
+                    Err(e) => {
+                        error!("{}: {}", Self::ERROR_GCP_ERROR_MESSAGE_PARSE, e.to_string());
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                error!("{}: {}", Self::ERROR_GCP_ERROR_MESSAGE_PARSE, e.to_string());
+                None
+            }
+        }
     }
 }
 
