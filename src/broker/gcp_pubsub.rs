@@ -187,8 +187,8 @@ struct BrokerSubscription {
 //
 #[derive(Error, Debug)]
 pub enum GCPPubsubError {
-    #[error("Request error: {0}")]
-    RequestError(String),
+    #[error("Request error: {message}")]
+    RequestError { message: String, status: u16 },
 
     #[error("Unknown error: {0}")]
     UnknownError(String),
@@ -387,9 +387,7 @@ impl Broker for GCPPubSubBroker {
             None => Some(1),
         };
 
-        // We do not process SendMessageResult because if we are retrying the message means the
-        // topic exists.
-        channel.send_message(&message).await.map(|_| ())
+        channel.send_message(&message).await
     }
 
     async fn send(&self, message: &Message, topic: &str) -> Result<(), BrokerError> {
@@ -402,26 +400,24 @@ impl Broker for GCPPubSubBroker {
         );
 
         match channel.send_message(message).await {
-            Ok(SendMessageResult::MessageSent) => Ok(()),
-            Ok(SendMessageResult::TopicNotFound) => {
+            Ok(_) => Ok(()),
+            Err(BrokerError::GCPPubsubError(GCPPubsubError::RequestError {
+                status: 404,
+                message: error_message,
+            })) => {
+                // If we have the producer configured to create the topic if it does not exist...
                 if let Some(true) = self.producer_options.create_topic {
+                    // Create the topic...
                     info!("Topic \"{}\" does not exist. Creating it...", topic);
                     channel.create_topic().await?;
 
-                    // TODO: This nesting is horrible!
-                    match channel.send_message(message).await {
-                        Ok(SendMessageResult::MessageSent) => Ok(()),
-                        Ok(SendMessageResult::TopicNotFound) => Err(GCPPubsubError::RequestError(
-                            format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, topic),
-                        )
-                        .into()),
-                        Err(e) => Err(e),
-                    }
+                    // Resend the message
+                    channel.send_message(message).await
                 } else {
-                    Err(GCPPubsubError::RequestError(format!(
-                        "{}: {}",
-                        MESSAGE_TOPIC_NOT_EXIST, topic
-                    ))
+                    Err(GCPPubsubError::RequestError {
+                        message: error_message,
+                        status: 404,
+                    }
                     .into())
                 }
             }
@@ -463,11 +459,6 @@ impl Broker for GCPPubSubBroker {
 
         Ok(())
     }
-}
-
-enum SendMessageResult {
-    TopicNotFound,
-    MessageSent,
 }
 
 #[derive(Clone, Debug)]
@@ -532,7 +523,7 @@ impl GCPChannel {
 
         // This error should never happen...
         let received_message = deserealized_msg.get(0).ok_or_else(|| {
-            GCPPubsubError::RequestError("Invalid request body, received empty message".to_owned())
+            GCPPubsubError::UnknownError("Invalid request body, received empty message".to_owned())
         })?;
 
         let data = base64::decode(&received_message.message.data).map_err(|e| {
@@ -550,7 +541,7 @@ impl GCPChannel {
         })
     }
 
-    async fn send_message(&self, message: &Message) -> Result<SendMessageResult, BrokerError> {
+    async fn send_message(&self, message: &Message) -> Result<(), BrokerError> {
         let message_payload = base64::encode(message.json_serialized()?);
         let formatted_message = json!({ "messages": [{ "data": message_payload }] }).to_string();
 
@@ -562,11 +553,24 @@ impl GCPChannel {
             .await
             .map_err(GCPPubsubError::RestClientError)?;
 
-        if response.status() == 404 {
-            return Ok(SendMessageResult::TopicNotFound);
+        let response_status = response.status().as_u16();
+        if response_status == 404 {
+            let error_message = match self.get_deserialized_error(response).await {
+                Some(e) => format!(
+                    "{}: {}\n{}",
+                    MESSAGE_TOPIC_NOT_EXIST, &self.topic, e.message
+                ),
+                None => format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, &self.topic),
+            };
+
+            return Err((GCPPubsubError::RequestError {
+                message: error_message,
+                status: response_status,
+            })
+            .into());
         }
 
-        Ok(SendMessageResult::MessageSent)
+        Ok(())
     }
 
     async fn acknowledge(&self, acknowledge_id: String) -> Result<(), BrokerError> {
@@ -628,13 +632,17 @@ impl GCPChannel {
                     .await
                     .map_err(GCPPubsubError::RestClientError)?;
 
-                if response.status() == 404 {
+                let response_status = response.status().as_u16();
+                if response_status == 404 {
                     let error_message = match self.get_deserialized_error(response).await {
                         Some(e) => format!("{}: {}\n{}", MESSAGE_TOPIC_NOT_EXIST, &self.topic, e.message),
                         None => format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, &self.topic),
                     };
 
-                    return Err(GCPPubsubError::RequestError(error_message).into());
+                    return Err((GCPPubsubError::RequestError {
+                        message: error_message,
+                        status: response_status
+                    }).into());
                 }
 
                 Ok(())
