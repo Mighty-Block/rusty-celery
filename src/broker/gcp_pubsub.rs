@@ -257,6 +257,18 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
             .last()
             .expect("Unable to get the GCP project from the Url");
 
+        // Build reqwest client
+        let mut default_headers = header::HeaderMap::new();
+        default_headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+
+        let client = reqwest::ClientBuilder::new()
+            .default_headers(default_headers)
+            .build()
+            .expect("There was an error building the REST client for GCP Pubsub.");
+
         Ok(GCPPubSubBroker {
             base_url: self.config.broker_url.clone(),
             producer_options: broker_configuration.producer.unwrap_or_default(),
@@ -264,6 +276,7 @@ impl BrokerBuilder for GCPPubSubBrokerBuilder {
             prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
             pending_tasks: Arc::new(AtomicU16::new(0)),
             gcp_project: project.to_string(),
+            connection: Arc::new(client),
         })
     }
 }
@@ -280,6 +293,8 @@ pub struct GCPPubSubBroker {
     prefetch_count: Arc<AtomicU16>,
 
     pending_tasks: Arc<AtomicU16>,
+
+    connection: Arc<reqwest::Client>,
 }
 
 #[async_trait]
@@ -326,11 +341,12 @@ impl Broker for GCPPubSubBroker {
             let consumer_tag = uuid.to_owned();
 
             // Create the channel
-            let gcp_channel = GCPChannel::new(
-                self.base_url.clone(),
-                topic.to_string(),
-                subscription.clone(),
-            );
+            let gcp_channel = GCPChannel {
+                base_url: self.base_url.clone(),
+                topic: topic.to_string(),
+                subscription: subscription.clone(),
+                connection: self.connection.clone(),
+            };
 
             // Susbcribe to the topic with the given subscription
             gcp_channel.subscribe_to_topic().await?;
@@ -392,11 +408,12 @@ impl Broker for GCPPubSubBroker {
     async fn send(&self, message: &Message, topic: &str) -> Result<(), BrokerError> {
         // We use the default subscription because we do not need a subscription to send a message
         // to a topic.
-        let channel = GCPChannel::new(
-            self.base_url.clone(),
-            topic.to_string(),
-            BrokerSubscription::default(),
-        );
+        let channel = GCPChannel {
+            base_url: self.base_url.clone(),
+            topic: topic.to_string(),
+            subscription: BrokerSubscription::default(),
+            connection: self.connection.clone(),
+        };
 
         match channel.send_message(message).await {
             Ok(_) => Ok(()),
@@ -462,7 +479,7 @@ impl Broker for GCPPubSubBroker {
 
 #[derive(Clone, Debug)]
 pub struct GCPChannel {
-    connection: reqwest::Client,
+    connection: Arc<reqwest::Client>,
     base_url: String,
     topic: String,
     subscription: BrokerSubscription,
@@ -471,27 +488,6 @@ pub struct GCPChannel {
 impl GCPChannel {
     const ERROR_GCP_ERROR_MESSAGE_PARSE: &'static str =
         "There was an error parsing a GCP Error Response";
-
-    fn new(base_url: String, topic: String, subscription: BrokerSubscription) -> Self {
-        // Build reqwest client
-        let mut default_headers = header::HeaderMap::new();
-        default_headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
-
-        let client = reqwest::ClientBuilder::new()
-            .default_headers(default_headers)
-            .build()
-            .expect("There was an error building the REST client for GCP Pubsub.");
-
-        GCPChannel {
-            connection: client,
-            base_url,
-            topic,
-            subscription,
-        }
-    }
 
     async fn pull_message(self) -> GCPConsumerOutput {
         // We have this loop in case the long polling request returns nothing. We just pull again
