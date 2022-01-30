@@ -17,14 +17,12 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs::File;
 use std::future::Future;
-use std::io::{BufReader, ErrorKind};
+use std::io::BufReader;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
 use thiserror::Error;
 use uuid::Uuid;
-
-const MESSAGE_TOPIC_NOT_EXIST: &str = "There was an error with the following topic";
 
 // Internal pubsub message
 #[derive(Serialize, Deserialize)]
@@ -197,6 +195,43 @@ pub enum GCPPubsubError {
     RestClientError(#[from] reqwest::Error),
 }
 
+impl GCPPubsubError {
+    const ERROR_GCP_ERROR_MESSAGE_PARSE: &'static str =
+        "There was an error parsing a GCP Error Response";
+
+    async fn get_request_error(response: reqwest::Response) -> Self {
+        let status = response.status().as_u16();
+        let response_body = response.text().await;
+
+        match response_body {
+            Ok(body) => {
+                let deserialized_error = serde_json::from_str::<GCPErrorMessage>(&body);
+
+                match deserialized_error {
+                    Ok(error) => Self::RequestError {
+                        status,
+                        message: error.error.message,
+                    },
+                    Err(e) => {
+                        error!("{}: {}", Self::ERROR_GCP_ERROR_MESSAGE_PARSE, e.to_string());
+                        Self::RequestError {
+                            status,
+                            message: body,
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("{}: {}", Self::ERROR_GCP_ERROR_MESSAGE_PARSE, e.to_string());
+                Self::RequestError {
+                    status,
+                    message: String::from(""),
+                }
+            }
+        }
+    }
+}
+
 // Broker builder
 struct Config {
     broker_url: String,
@@ -348,8 +383,13 @@ impl Broker for GCPPubSubBroker {
                 connection: self.connection.clone(),
             };
 
-            // Susbcribe to the topic with the given subscription
-            gcp_channel.subscribe_to_topic().await?;
+            // Susbcribe to the topic with the given subscription, if the subscription exist, we do
+            // nothing, otherwise we return an error
+            match gcp_channel.subscribe_to_topic().await {
+                Err(GCPPubsubError::RequestError { status: 409, .. }) => {}
+                Err(e) => return Err(e.into()),
+                _ => {}
+            }
 
             let consumer = GCPConsumer {
                 pending_tasks: self.pending_tasks.clone(),
@@ -375,18 +415,18 @@ impl Broker for GCPPubSubBroker {
     async fn ack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
         let (channel, delivered_message) = delivery;
 
-        channel
+        Ok(channel
             .acknowledge(delivered_message.acknowledge_id.clone())
-            .await
+            .await?)
     }
 
     async fn nack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
         let (channel, delivered_message) = delivery;
 
         // Send nack to pubsub
-        channel
+        Ok(channel
             .modify_ack_deadline(delivered_message.acknowledge_id.clone(), 0)
-            .await
+            .await?)
     }
 
     async fn retry(
@@ -402,7 +442,8 @@ impl Broker for GCPPubSubBroker {
             None => Some(1),
         };
 
-        channel.send_message(&message).await
+        let message_payload = base64::encode(message.json_serialized()?);
+        Ok(channel.send_message(message_payload).await?)
     }
 
     async fn send(&self, message: &Message, topic: &str) -> Result<(), BrokerError> {
@@ -415,12 +456,13 @@ impl Broker for GCPPubSubBroker {
             connection: self.connection.clone(),
         };
 
-        match channel.send_message(message).await {
+        let message_payload = base64::encode(message.json_serialized()?);
+        match channel.send_message(message_payload.clone()).await {
             Ok(_) => Ok(()),
-            Err(BrokerError::GCPPubsubError(GCPPubsubError::RequestError {
+            Err(GCPPubsubError::RequestError {
                 status: 404,
                 message: error_message,
-            })) => {
+            }) => {
                 // If we have the producer configured to create the topic if it does not exist...
                 if let Some(true) = self.producer_options.create_topic {
                     // Create the topic...
@@ -428,7 +470,7 @@ impl Broker for GCPPubSubBroker {
                     channel.create_topic().await?;
 
                     // Resend the message
-                    channel.send_message(message).await
+                    Ok(channel.send_message(message_payload).await?)
                 } else {
                     Err(GCPPubsubError::RequestError {
                         message: error_message,
@@ -437,7 +479,7 @@ impl Broker for GCPPubSubBroker {
                     .into())
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -486,10 +528,7 @@ pub struct GCPChannel {
 }
 
 impl GCPChannel {
-    const ERROR_GCP_ERROR_MESSAGE_PARSE: &'static str =
-        "There was an error parsing a GCP Error Response";
-
-    async fn pull_message(self) -> GCPConsumerOutput {
+    async fn pull_message(self) -> Result<GCPDelivery, GCPPubsubError> {
         // We have this loop in case the long polling request returns nothing. We just pull again
         let deserealized_msg = loop {
             let response = self
@@ -509,7 +548,7 @@ impl GCPChannel {
                 .map_err(GCPPubsubError::RestClientError)?;
 
             let deserialized = serde_json::from_str::<PubsubPullResponse>(&response_body)
-                .map_err(BrokerError::DeserializeError)?;
+                .map_err(|e| GCPPubsubError::UnknownError(e.to_string()))?;
 
             if let Some(messages) = deserialized.received_messages {
                 break messages;
@@ -521,12 +560,11 @@ impl GCPChannel {
             GCPPubsubError::UnknownError("Invalid request body, received empty message".to_owned())
         })?;
 
-        let data = base64::decode(&received_message.message.data).map_err(|e| {
-            BrokerError::IoError(std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
-        })?;
+        let data = base64::decode(&received_message.message.data)
+            .map_err(|e| GCPPubsubError::UnknownError(e.to_string()))?;
 
-        let delivery: protocol::Delivery =
-            serde_json::from_slice(&data).map_err(BrokerError::DeserializeError)?;
+        let delivery: protocol::Delivery = serde_json::from_slice(&data)
+            .map_err(|e| GCPPubsubError::UnknownError(e.to_string()))?;
 
         Ok(GCPDelivery {
             acknowledge_id: received_message.ack_id.clone(),
@@ -536,8 +574,7 @@ impl GCPChannel {
         })
     }
 
-    async fn send_message(&self, message: &Message) -> Result<(), BrokerError> {
-        let message_payload = base64::encode(message.json_serialized()?);
+    async fn send_message(&self, message_payload: String) -> Result<(), GCPPubsubError> {
         let formatted_message = json!({ "messages": [{ "data": message_payload }] }).to_string();
 
         let response = self
@@ -548,28 +585,12 @@ impl GCPChannel {
             .await
             .map_err(GCPPubsubError::RestClientError)?;
 
-        let response_status = response.status().as_u16();
-        if response_status == 404 {
-            let error_message = match self.get_deserialized_error(response).await {
-                Some(e) => format!(
-                    "{}: {}\n{}",
-                    MESSAGE_TOPIC_NOT_EXIST, &self.topic, e.message
-                ),
-                None => format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, &self.topic),
-            };
-
-            return Err((GCPPubsubError::RequestError {
-                message: error_message,
-                status: response_status,
-            })
-            .into());
-        }
-
-        Ok(())
+        self.process_request_response(response).await
     }
 
-    async fn acknowledge(&self, acknowledge_id: String) -> Result<(), BrokerError> {
-        self.connection
+    async fn acknowledge(&self, acknowledge_id: String) -> Result<(), GCPPubsubError> {
+        let response = self
+            .connection
             .post(format!(
                 "{}/subscriptions/{}:acknowledge",
                 &self.base_url, &self.subscription.name
@@ -579,15 +600,16 @@ impl GCPChannel {
             .await
             .map_err(GCPPubsubError::RestClientError)?;
 
-        Ok(())
+        self.process_request_response(response).await
     }
 
     async fn modify_ack_deadline(
         &self,
         acknowledge_id: String,
         ack_deadline_seconds: u16,
-    ) -> Result<(), BrokerError> {
-        self.connection
+    ) -> Result<(), GCPPubsubError> {
+        let response = self
+            .connection
             .post(format!(
                 "{}/subscriptions/{}:modifyAckDeadline",
                 &self.base_url, &self.subscription.name
@@ -600,20 +622,21 @@ impl GCPChannel {
             .await
             .map_err(GCPPubsubError::RestClientError)?;
 
-        Ok(())
+        self.process_request_response(response).await
     }
 
-    async fn create_topic(&self) -> Result<(), BrokerError> {
-        self.connection
+    async fn create_topic(&self) -> Result<(), GCPPubsubError> {
+        let response = self
+            .connection
             .put(format!("{}/topics/{}", &self.base_url, &self.topic))
             .send()
             .await
             .map_err(GCPPubsubError::RestClientError)?;
 
-        Ok(())
+        self.process_request_response(response).await
     }
 
-    async fn subscribe_to_topic(&self) -> Result<(), BrokerError> {
+    async fn subscribe_to_topic(&self) -> Result<(), GCPPubsubError> {
         match serde_json::to_string(&self.subscription) {
             Ok(subscription_json) => {
                 let response = self
@@ -623,55 +646,32 @@ impl GCPChannel {
                         &self.base_url, &self.subscription.name
                     ))
                     .body(subscription_json)
+
                     .send()
                     .await
                     .map_err(GCPPubsubError::RestClientError)?;
 
-                let response_status = response.status().as_u16();
-                if response_status == 404 {
-                    let error_message = match self.get_deserialized_error(response).await {
-                        Some(e) => format!("{}: {}\n{}", MESSAGE_TOPIC_NOT_EXIST, &self.topic, e.message),
-                        None => format!("{}: {}", MESSAGE_TOPIC_NOT_EXIST, &self.topic),
-                    };
-
-                    return Err((GCPPubsubError::RequestError {
-                        message: error_message,
-                        status: response_status
-                    }).into());
-                }
-
-                Ok(())
+                self.process_request_response(response).await
             }
             Err(e) => {
                 Err(GCPPubsubError::UnknownError(format!(
                     "There was an error parsing the subscription options for topic \"{}\". Please check the configuration.\n{}",
                     &self.topic,
                     e.to_string()
-                ))
-                .into())
+                )))
             }
         }
     }
 
-    async fn get_deserialized_error(&self, response: reqwest::Response) -> Option<GCPErrorDetail> {
-        let response_body = response.text().await;
-
-        match response_body {
-            Ok(body) => {
-                let deserialized_error = serde_json::from_str::<GCPErrorMessage>(&body);
-
-                match deserialized_error {
-                    Ok(error) => Some(error.error),
-                    Err(e) => {
-                        error!("{}: {}", Self::ERROR_GCP_ERROR_MESSAGE_PARSE, e.to_string());
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                error!("{}: {}", Self::ERROR_GCP_ERROR_MESSAGE_PARSE, e.to_string());
-                None
-            }
+    async fn process_request_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<(), GCPPubsubError> {
+        let status = response.status().as_u16();
+        if 200 >= status && status <= 299 {
+            Ok(())
+        } else {
+            Err(GCPPubsubError::get_request_error(response).await)
         }
     }
 }
@@ -690,8 +690,8 @@ impl TryDeserializeMessage for (GCPChannel, GCPDelivery) {
     }
 }
 
-type GCPConsumerOutput = Result<GCPDelivery, BrokerError>;
-type GCPConsumerOutputFuture = Box<dyn Future<Output = Result<GCPDelivery, BrokerError>>>;
+type GCPConsumerOutput = Result<GCPDelivery, GCPPubsubError>;
+type GCPConsumerOutputFuture = Box<dyn Future<Output = GCPConsumerOutput>>;
 
 pub struct GCPConsumer {
     pending_tasks: Arc<AtomicU16>,
@@ -740,7 +740,7 @@ impl Stream for GCPConsumer {
                     Poll::Ready(Some(Ok((self.channel.clone(), item))))
                 }
                 Err(err) => {
-                    (self.error_handler)(err);
+                    (self.error_handler)(err.into());
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
